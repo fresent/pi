@@ -279,8 +279,11 @@ export class AgentSession {
 
 	// Stale tool call text recovery
 	private _staleToolCallAttempt = 0;
+<<<<<<< HEAD
 	private _staleToolCallTotalAttempts = 0;
 	private static readonly MAX_STALE_TOOL_CALL_TOTAL = 6;
+=======
+>>>>>>> b9c89b795790a2d398ac1e075ad1908037a9faa6
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -2579,6 +2582,7 @@ export class AgentSession {
 	// =========================================================================
 	// Stale Tool Call Text Recovery
 	// =========================================================================
+<<<<<<< HEAD
 	/** 
 	* Add a separate stripping pass that removes DSML artifacts from text content even when real tool calls are present:
 	*/
@@ -2596,6 +2600,9 @@ export class AgentSession {
 		return { ...message, content: cleanedContent };
 	}
 	
+=======
+
+>>>>>>> b9c89b795790a2d398ac1e075ad1908037a9faa6
 	/**
 	 * Check if an assistant message contains tool-call-like XML text instead of
 	 * proper structured tool calls.
@@ -2605,11 +2612,17 @@ export class AgentSession {
 	 * auto-continues with a hint to use proper tool calls.
 	 */
 	private _hasStaleToolCallText(message: AssistantMessage): boolean {
+<<<<<<< HEAD
 		// Only check messages that stopped naturally; errors/aborts are handled elsewhere.
 		// Also handle "toolUse" stop because DeepSeek can emit DSML text alongside
 		// a real tool_calls delta, causing stopReason "toolUse" with no toolCall blocks.
 		if (message.stopReason === "error") return false;
 		if (message.stopReason !== "stop" && message.stopReason !== "toolUse") return false;
+=======
+		// Only check messages that stopped naturally; errors/aborts are handled
+		// elsewhere
+		if (message.stopReason !== "stop") return false;
+>>>>>>> b9c89b795790a2d398ac1e075ad1908037a9faa6
 
 		// If there are already proper tool calls, no intervention needed
 		if (message.content.some((c) => c.type === "toolCall")) return false;
@@ -2620,6 +2633,7 @@ export class AgentSession {
 			.map((c) => (c as TextContent).text)
 			.join("");
 
+<<<<<<< HEAD
 		// Generic XML tool call format (Hermes/some models)
 		const hasXmlToolCall = /<tool_calls?[^>]*>[\s\S]*?<invoke\s+name=/i.test(textContent);
 
@@ -2633,6 +2647,10 @@ export class AgentSession {
   
 		// Pattern: <tool_calls>...</tool_calls> containing <invoke name="toolName">
 		//return /<tool_calls?[^>]*>[\s\S]*?<invoke\s+name=/i.test(textContent);
+=======
+		// Pattern: <tool_calls>...</tool_calls> containing <invoke name="toolName">
+		return /<tool_calls?[^>]*>[\s\S]*?<invoke\s+name=/i.test(textContent);
+>>>>>>> b9c89b795790a2d398ac1e075ad1908037a9faa6
 	}
 
 	/**
@@ -2642,12 +2660,18 @@ export class AgentSession {
 	 */
 	private _handleStaleToolCallText(_message: AssistantMessage): void {
 		this._staleToolCallAttempt++;
+<<<<<<< HEAD
 		this._staleToolCallTotalAttempts++;
 
 		// Cap at 2 consecutive retries, and 6 total across the session, to
 		// prevent infinite loops on persistently broken models.
 		if (this._staleToolCallAttempt > 2 || 
 			this._staleToolCallTotalAttempts > AgentSession.MAX_STALE_TOOL_CALL_TOTAL) {
+=======
+
+		// Limit to 2 consecutive auto-retries to prevent infinite loops
+		if (this._staleToolCallAttempt > 2) {
+>>>>>>> b9c89b795790a2d398ac1e075ad1908037a9faa6
 			this._staleToolCallAttempt = 0;
 			return;
 		}
