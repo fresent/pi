@@ -242,6 +242,9 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 // ============================================================================
 
 export class AgentSession {
+	private static readonly STALE_TOOL_CALL_FOLLOW_UP_TEXT =
+		"Please continue and use the proper tool calling functions instead of writing tool calls as text.";
+
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
@@ -273,6 +276,11 @@ export class AgentSession {
 	private _retryAttempt = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
+
+	// Stale tool call text recovery
+	private _staleToolCallAttempt = 0;
+	private _staleToolCallTotalAttempts = 0;
+	private static readonly MAX_STALE_TOOL_CALL_TOTAL = 6;
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -501,9 +509,10 @@ export class AgentSession {
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
-			this._overflowRecoveryAttempted = false;
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
+				const isStaleToolCallRecoveryFollowUp = this._isStaleToolCallRecoveryFollowUp(messageText);
+
 				// Check steering queue first
 				const steeringIndex = this._steeringMessages.indexOf(messageText);
 				if (steeringIndex !== -1) {
@@ -516,6 +525,11 @@ export class AgentSession {
 						this._followUpMessages.splice(followUpIndex, 1);
 						this._emitQueueUpdate();
 					}
+				}
+
+				if (!isStaleToolCallRecoveryFollowUp) {
+					this._overflowRecoveryAttempted = false;
+					this._staleToolCallAttempt = 0;
 				}
 			}
 		}
@@ -542,18 +556,30 @@ export class AgentSession {
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				// Regular LLM message - persist as SessionMessageEntry.
+				// Strip DSML text artifacts before persisting so they never reach
+				// the session JSONL (mixed tool call + DSML text leak from DeepSeek).
+				const messageToStore: Message =
+					event.message.role === "assistant"
+						? this._stripDsmlTextArtifacts(event.message as AssistantMessage)
+						: event.message;
+				this.sessionManager.appendMessage(messageToStore);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
-				this._lastAssistantMessage = event.message;
+				// Use the stripped version so agent_end compaction also sees clean content
+				const assistantMsg = this._stripDsmlTextArtifacts(event.message as AssistantMessage);
+				this._lastAssistantMessage = assistantMsg;
 
-				const assistantMsg = event.message as AssistantMessage;
 				if (assistantMsg.stopReason !== "error") {
 					this._overflowRecoveryAttempted = false;
+				}
+
+				// Reset stale tool call counter when the model makes proper tool calls
+				if (assistantMsg.content.some((c) => c.type === "toolCall")) {
+					this._staleToolCallAttempt = 0;
 				}
 
 				// Reset retry counter immediately on successful assistant response
@@ -578,6 +604,12 @@ export class AgentSession {
 			if (this._isRetryableError(msg)) {
 				const didRetry = await this._handleRetryableError(msg);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+			}
+
+			// Check for stale tool call text (model wrote tool calls as XML instead of calling them)
+			if (this._hasStaleToolCallText(msg)) {
+				this._handleStaleToolCallText(msg);
+				return;
 			}
 
 			this._resolveRetry();
@@ -2542,6 +2574,108 @@ export class AgentSession {
 	 */
 	setAutoRetryEnabled(enabled: boolean): void {
 		this.settingsManager.setRetryEnabled(enabled);
+	}
+
+	// =========================================================================
+	// Stale Tool Call Text Recovery
+	// =========================================================================
+	/** 
+	* Add a separate stripping pass that removes DSML artifacts from text content even when real tool calls are present:
+	*/
+	private _stripDsmlTextArtifacts(message: AssistantMessage): AssistantMessage {
+		const dsmlPattern = /\uFF5CDSML\uFF5C[\s\S]*$/u; // DSML marker and everything after
+		const hasToolCalls = message.content.some((c) => c.type === "toolCall");
+		if (!hasToolCalls) return message;
+
+		const cleanedContent = message.content.map((c) => {
+			if (c.type !== "text") return c;
+			const cleaned = (c as TextContent).text.replace(dsmlPattern, "").trimEnd();
+			return { ...c, text: cleaned };
+		}).filter((c) => c.type !== "text" || (c as TextContent).text.length > 0);
+
+		return { ...message, content: cleanedContent };
+	}
+	
+	/**
+	 * Check if an assistant message contains tool-call-like XML text instead of
+	 * proper structured tool calls.
+	 * Some models (e.g., deepseek-v4-flash) occasionally output tool call blocks
+	 * as text (like `<tool_calls><invoke name="...">...</invoke></tool_calls>`)
+	 * instead of using the actual tool calling mechanism. When detected, pi
+	 * auto-continues with a hint to use proper tool calls.
+	 */
+	private _hasStaleToolCallText(message: AssistantMessage): boolean {
+		// Only check messages that stopped naturally; errors/aborts are handled elsewhere.
+		// Also handle "toolUse" stop because DeepSeek can emit DSML text alongside
+		// a real tool_calls delta, causing stopReason "toolUse" with no toolCall blocks.
+		if (message.stopReason === "error") return false;
+		if (message.stopReason !== "stop" && message.stopReason !== "toolUse") return false;
+
+		// If there are already proper tool calls, no intervention needed
+		if (message.content.some((c) => c.type === "toolCall")) return false;
+
+		// Check text content for tool call XML patterns
+		const textContent = message.content
+			.filter((c) => c.type === "text")
+			.map((c) => (c as TextContent).text)
+			.join("");
+
+		// Generic XML tool call format (Hermes/some models)
+		const hasXmlToolCall = /<tool_calls?[^>]*>[\s\S]*?<invoke\s+name=/i.test(textContent);
+
+		// DeepSeek DSML format — uses Unicode fullwidth vertical bars (U+FF5C)
+		// and lower-one-eighth-block separator (U+2581)
+		const hasDsmlMarker = /\u{FF5C}DSML\u{FF5C}tool_calls/u.test(textContent) ||
+		  /\u{FF5C}tool[\u{2581}_]calls\u{FF5C}/u.test(textContent) ||
+		  /<\uFF5CDSML\uFF5C/.test(textContent);
+
+		return hasXmlToolCall || hasDsmlMarker;
+  
+		// Pattern: <tool_calls>...</tool_calls> containing <invoke name="toolName">
+		//return /<tool_calls?[^>]*>[\s\S]*?<invoke\s+name=/i.test(textContent);
+	}
+
+	/**
+	 * Handle a message that contains tool-call-like text.
+	 * Queues a follow-up message telling the model to use proper tool calls,
+	 * then schedules a continue to let the model retry.
+	 */
+	private _handleStaleToolCallText(_message: AssistantMessage): void {
+		this._staleToolCallAttempt++;
+		this._staleToolCallTotalAttempts++;
+
+		// Cap at 2 consecutive retries, and 6 total across the session, to
+		// prevent infinite loops on persistently broken models.
+		if (this._staleToolCallAttempt > 2 || 
+			this._staleToolCallTotalAttempts > AgentSession.MAX_STALE_TOOL_CALL_TOTAL) {
+			this._staleToolCallAttempt = 0;
+			return;
+		}
+
+		this._resolveRetry();
+
+		// Queue a follow-up message telling the model to use proper tool calls
+		const followUpText = AgentSession.STALE_TOOL_CALL_FOLLOW_UP_TEXT;
+
+		this.agent.followUp({
+			role: "user",
+			content: [{ type: "text", text: followUpText }],
+			timestamp: Date.now(),
+		});
+
+		// Also track in UI queue so it shows as pending
+		this._followUpMessages.push(followUpText);
+		this._emitQueueUpdate();
+
+		// Schedule continue to let the model retry.
+		// Uses setTimeout to break out of the event handler chain.
+		setTimeout(() => {
+			this.agent.continue().catch(() => {});
+		}, 0);
+	}
+
+	private _isStaleToolCallRecoveryFollowUp(messageText: string): boolean {
+		return messageText === AgentSession.STALE_TOOL_CALL_FOLLOW_UP_TEXT;
 	}
 
 	// =========================================================================
