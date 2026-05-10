@@ -243,7 +243,7 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 export class AgentSession {
 	private static readonly STALE_TOOL_CALL_FOLLOW_UP_TEXT =
-		"Please continue and use the proper tool calling functions instead of writing tool calls as text.";
+		"Please continue and double confirm, as last call might have failed.";
 
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -2583,17 +2583,30 @@ export class AgentSession {
 	 * Add a separate stripping pass that removes DSML artifacts from text content even when real tool calls are present:
 	 */
 	private _stripDsmlTextArtifacts(message: AssistantMessage): AssistantMessage {
-		const dsmlPattern = /\uFF5CDSML\uFF5C[\s\S]*$/u; // DSML marker and everything after
+		
 		const hasToolCalls = message.content.some((c) => c.type === "toolCall");
 		if (!hasToolCalls) return message;
+		
+		const dsmlSuffixPattern = /\uFF5CDSML\uFF5C[\s\S]*$/u; // DSML marker and everything after
+		// For thinking: strip only the DSML block(s), preserve reasoning before/after
+		const dsmlBlockPattern = /<\uFF5CDSML\uFF5C[\s\S]*?<\/\uFF5CDSML\uFF5Ctool_calls>/g;
 
 		const cleanedContent = message.content
 			.map((c) => {
-				if (c.type !== "text") return c;
-				const cleaned = (c as TextContent).text.replace(dsmlPattern, "").trimEnd();
-				return { ...c, text: cleaned };
+				if (c.type === "text") {
+					return { ...c, text: (c as TextContent).text.replace(dsmlSuffixPattern, "").trimEnd() };
+				}
+				if (c.type === "thinking") {
+					const tc = c as { type: "thinking"; thinking: string; thinkingSignature: string };
+					return { ...tc, thinking: tc.thinking.replace(dsmlBlockPattern, "").trimEnd() };
+				}
+				return c;
 			})
-			.filter((c) => c.type !== "text" || (c as TextContent).text.length > 0);
+			.filter((c) => {
+				if (c.type === "text") return (c as TextContent).text.length > 0;
+				if (c.type === "thinking") return (c as any).thinking.length > 0;
+				return true;
+			});
 
 		return { ...message, content: cleanedContent };
 	}
@@ -2611,15 +2624,25 @@ export class AgentSession {
 		// Also handle "toolUse" stop because DeepSeek can emit DSML text alongside
 		// a real tool_calls delta, causing stopReason "toolUse" with no toolCall blocks.
 		if (message.stopReason === "error") return false;
-		if (message.stopReason !== "stop" && message.stopReason !== "toolUse") return false;
+		if (message.stopReason !== "stop" && message.stopReason !== "toolUse") {
+			return false;
+		}
 
 		// If there are already proper tool calls, no intervention needed
 		if (message.content.some((c) => c.type === "toolCall")) return false;
 
 		// Check text content for tool call XML patterns
+		//const textContent = message.content
+		//	.filter((c) => c.type === "text")
+		//	.map((c) => (c as TextContent).text)
+		//	.join("");
+		// Also scan thinking blocks — DeepSeek embeds DSML inside reasoning content
 		const textContent = message.content
-			.filter((c) => c.type === "text")
-			.map((c) => (c as TextContent).text)
+			.filter((c) => c.type === "text" || c.type === "thinking")
+			.map((c) => {
+				if (c.type === "text") return (c as TextContent).text;
+				return (c as { type: "thinking"; thinking: string }).thinking ?? "";
+			})
 			.join("");
 
 		// Generic XML tool call format (Hermes/some models)
@@ -2648,6 +2671,7 @@ export class AgentSession {
 		// prevent infinite loops on persistently broken models.
 		if (this._staleToolCallAttempt > 2 || this._staleToolCallTotalAttempts > AgentSession.MAX_STALE_TOOL_CALL_TOTAL) {
 			this._staleToolCallAttempt = 0;
+			this._staleToolCallTotalAttempts = 0;  // ← add this line
 			return;
 		}
 
